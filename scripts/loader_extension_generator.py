@@ -487,8 +487,9 @@ class LoaderExtensionOutputGenerator(OutputGenerator):
                 commands = self.ext_commands
 
             for cur_cmd in commands:
+                is_instance_ext = x > 0 and cur_cmd.ext_type == 'instance'
                 is_inst_handle_type = cur_cmd.name in ADD_INST_CMDS or cur_cmd.handle_type == 'VkInstance' or cur_cmd.handle_type == 'VkPhysicalDevice'
-                if is_inst_handle_type:
+                if is_inst_handle_type or is_instance_ext:
 
                     if cur_cmd.ext_name != cur_extension_name:
                         if 'VK_VERSION_' in cur_cmd.ext_name:
@@ -847,8 +848,9 @@ class LoaderExtensionOutputGenerator(OutputGenerator):
                     commands = self.ext_commands
 
                 for cur_cmd in commands:
+                    is_instance_ext = x > 0 and cur_cmd.ext_type == 'instance'
                     is_inst_handle_type = cur_cmd.handle_type == 'VkInstance' or cur_cmd.handle_type == 'VkPhysicalDevice'
-                    if ((cur_type == 'instance' and is_inst_handle_type) or (cur_type == 'device' and not is_inst_handle_type)):
+                    if ((cur_type == 'instance' and is_inst_handle_type) or (cur_type == 'device' and not is_inst_handle_type) or is_instance_ext):
 
                         if cur_cmd.ext_name != cur_extension_name:
                             if 'VK_VERSION_' in cur_cmd.ext_name:
