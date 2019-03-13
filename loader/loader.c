@@ -25,6 +25,12 @@
  *
  */
 
+// This needs to be defined first, or else we'll get redefinitions on NTSTATUS values
+#ifdef _WIN32
+#define UMDF_USING_NTSTATUS
+#include <ntstatus.h>
+#endif
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -63,6 +69,8 @@
 #include <Cfgmgr32.h>
 #include <initguid.h>
 #include <Devpkey.h>
+#include <winternl.h>
+#include <d3dkmthk.h>
 #endif
 
 // This is a CMake generated file with #defines for any functions/includes
@@ -3706,6 +3714,118 @@ out:
 }
 
 #ifdef _WIN32
+// Read manifest JSON files uing the Windows driver interface
+static VkResult ReadManifestsFromD3DAdapters(const struct loader_instance *inst, char **reg_data, PDWORD reg_data_size, const wchar_t* value_name)
+{
+    VkResult result = VK_INCOMPLETE;
+    D3DKMT_ENUMADAPTERS2 adapters = {
+        .NumAdapters = 0,
+        .pAdapters = NULL
+    };
+    D3DDDI_QUERYREGISTRY_INFO *full_info = NULL;
+    char *json_path = NULL;
+
+    // Get all of the adapters
+    NTSTATUS status = D3DKMTEnumAdapters2(&adapters);
+    if (status == STATUS_SUCCESS && adapters.NumAdapters > 0) {
+        adapters.pAdapters = loader_instance_heap_alloc(inst, sizeof(D3DKMT_ADAPTERINFO) * adapters.NumAdapters, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+        if (adapters.pAdapters == NULL) {
+            goto out;
+        }
+        status = D3DKMTEnumAdapters2(&adapters);
+    }
+    if (status != STATUS_SUCCESS) {
+        goto out;
+    }
+
+    // If that worked, we need to get the manifest file(s) for each adapter
+    for (ULONG i = 0; i < adapters.NumAdapters; ++i) {
+
+        // The first query should just check if the field exists and how big it is
+        D3DDDI_QUERYREGISTRY_INFO filename_info = {
+            .QueryType = D3DDDI_QUERYREGISTRY_ADAPTERKEY,
+            .ValueType = REG_MULTI_SZ,
+            .PhysicalAdapterIndex = 0,
+        };
+        wcsncpy(filename_info.ValueName, value_name, sizeof(filename_info.ValueName) / sizeof(DWORD));
+        D3DKMT_QUERYADAPTERINFO query_info = {
+            .hAdapter = adapters.pAdapters[i].hAdapter,
+            .Type = KMTQAITYPE_QUERYREGISTRY,
+            .pPrivateDriverData = &filename_info,
+             .PrivateDriverDataSize = sizeof(filename_info),
+        };
+        status = D3DKMTQueryAdapterInfo(&query_info);
+
+        // This error indicates that the type didn't match, so we'll try a REG_SZ
+        if (status == STATUS_INVALID_PARAMETER) {
+            filename_info.ValueType = REG_SZ;
+            status = D3DKMTQueryAdapterInfo(&query_info);
+        }
+
+        if (status != STATUS_SUCCESS) {
+            continue;
+        }
+
+        // The second query needs to allocate space for the string to overflow out the back of the struct
+        size_t full_size = sizeof(filename_info) + (filename_info.OutputValueSize * sizeof(WCHAR));
+        full_info = loader_instance_heap_alloc(inst, full_size, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+        if (full_info == NULL) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto out;
+        }
+
+        memcpy(full_info, &filename_info, sizeof(filename_info));
+        query_info.pPrivateDriverData = full_info;
+        query_info.PrivateDriverDataSize = (UINT) full_size;
+        status = D3DKMTQueryAdapterInfo(&query_info);
+        if (status != STATUS_SUCCESS) {
+            goto out;
+        }
+
+        // Convert the wide string to a narrow string
+        json_path = loader_instance_heap_alloc(inst, full_info->OutputValueSize, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+        if (json_path == NULL) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto out;
+        }
+
+        // Iterate over each component string
+        for (const wchar_t *curr_path = full_info->OutputString; curr_path[0] != '\0'; curr_path += wcslen(curr_path) + 1) {
+            WideCharToMultiByte(CP_UTF8, 0, curr_path, full_info->OutputValueSize / sizeof(WCHAR), json_path, full_info->OutputValueSize, NULL, NULL);
+
+            // Add the string to the output list
+            result = VK_SUCCESS;
+            loaderAddJsonEntry(inst, reg_data, reg_data_size, (LPCTSTR) L"EnumAdapters", REG_SZ, json_path, (DWORD) strlen(json_path) + 1, &result);
+            if (result != VK_SUCCESS) {
+                goto out;
+            }
+
+            // If this is a string and not a multi-string, we don't want to go throught the loop more than once
+            if (full_info->ValueType == REG_SZ) {
+                break;
+            }
+        }
+
+        loader_instance_heap_free(inst, json_path);
+        json_path = NULL;
+        loader_instance_heap_free(inst, full_info);
+        full_info = NULL;
+    }
+
+out:
+    if (json_path != NULL) {
+        loader_instance_heap_free(inst, json_path);
+    }
+    if (full_info != NULL) {
+        loader_instance_heap_free(inst, full_info);
+    }
+    if (adapters.pAdapters != NULL) {
+        loader_instance_heap_free(inst, adapters.pAdapters);
+    }
+
+    return result;
+}
+
 // Look for data files in the registry.
 static VkResult ReadDataFilesInRegistry(const struct loader_instance *inst, enum loader_data_files_type data_file_type,
                                         bool warn_if_not_present, char *registry_location, struct loader_data_files *out_files) {
@@ -3718,11 +3838,21 @@ static VkResult ReadDataFilesInRegistry(const struct loader_instance *inst, enum
     VkResult regHKR_result = VK_SUCCESS;
     DWORD reg_size = 4096;
     if (!strncmp(registry_location, VK_DRIVERS_INFO_REGISTRY_LOC, sizeof(VK_DRIVERS_INFO_REGISTRY_LOC))) {
-        regHKR_result = loaderGetDeviceRegistryFiles(inst, &search_path, &reg_size, LoaderPnpDriverRegistry());
+        // If we're looking for drivers we need to try enumerating adapters
+        regHKR_result = ReadManifestsFromD3DAdapters(inst, &search_path, &reg_size, LoaderPnpDriverRegistryWide());
+        if (regHKR_result == VK_INCOMPLETE) {
+            regHKR_result = loaderGetDeviceRegistryFiles(inst, &search_path, &reg_size, LoaderPnpDriverRegistry());
+        }
     } else if (!strncmp(registry_location, VK_ELAYERS_INFO_REGISTRY_LOC, sizeof(VK_ELAYERS_INFO_REGISTRY_LOC))) {
-        regHKR_result = loaderGetDeviceRegistryFiles(inst, &search_path, &reg_size, LoaderPnpELayerRegistry());
+        regHKR_result = ReadManifestsFromD3DAdapters(inst, &search_path, &reg_size, LoaderPnpELayerRegistryWide());
+        if (regHKR_result == VK_INCOMPLETE) {
+            regHKR_result = loaderGetDeviceRegistryFiles(inst, &search_path, &reg_size, LoaderPnpELayerRegistry());
+        }
     } else if (!strncmp(registry_location, VK_ILAYERS_INFO_REGISTRY_LOC, sizeof(VK_ILAYERS_INFO_REGISTRY_LOC))) {
-        regHKR_result = loaderGetDeviceRegistryFiles(inst, &search_path, &reg_size, LoaderPnpILayerRegistry());
+        regHKR_result = ReadManifestsFromD3DAdapters(inst, &search_path, &reg_size, LoaderPnpILayerRegistryWide());
+        if (regHKR_result == VK_INCOMPLETE) {
+            regHKR_result = loaderGetDeviceRegistryFiles(inst, &search_path, &reg_size, LoaderPnpILayerRegistry());
+        }
     }
 
     // This call looks into the Khronos non-device specific section of the registry.
