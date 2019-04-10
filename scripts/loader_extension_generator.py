@@ -254,7 +254,7 @@ class LoaderExtensionOutputGenerator(OutputGenerator):
         self.type = interface.get('type')
         self.num_commands = 0
         name = interface.get('name')
-        self.currentExtension = name 
+        self.currentExtension = name
 
     #
     # Process commands, adding to appropriate dispatch tables
@@ -1506,7 +1506,7 @@ class LoaderExtensionOutputGenerator(OutputGenerator):
                 commands = self.ext_commands
 
             for cur_cmd in commands:
-                
+
                 if cur_cmd.handle_type == 'VkInstance' or cur_cmd.handle_type == 'VkPhysicalDevice':
                     if cur_cmd.ext_name != cur_extension_name:
                         if 'VK_VERSION_' in cur_cmd.ext_name:
@@ -1563,4 +1563,3 @@ class LoaderExtensionOutputGenerator(OutputGenerator):
                 table += '#endif // %s\n' % ext.protect
         table += '                                                  NULL };\n'
         return table
-

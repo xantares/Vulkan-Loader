@@ -88,6 +88,10 @@ struct loader_phys_dev_per_icd {
     uint32_t count;
     VkPhysicalDevice *phys_devs;
     struct loader_icd_term *this_icd_term;
+#if defined(WIN32)
+    // On Windows, we need to store the IDs so we can match the VkPhysicalDevice to the IDXGIAdapter
+    VkPhysicalDeviceIDProperties *ids;
+#endif
 };
 
 enum loader_debug {
@@ -6188,6 +6192,7 @@ out:
     return res;
 }
 
+#include "dxgi1_6.h"
 VkResult setupLoaderTrampPhysDevs(VkInstance instance) {
     VkResult res = VK_SUCCESS;
     VkPhysicalDevice *local_phys_devs = NULL;
@@ -6319,6 +6324,42 @@ out:
     return res;
 }
 
+// Add a terminator physical device to a new list, copying it from the old list if it was present there
+VkResult AddTermPhysDev(struct loader_instance *inst, struct loader_phys_dev_per_icd *drivers, uint32_t driver_index,
+    uint32_t pdev_index, struct loader_physical_device_term **output_pdev) {
+    VkResult result = VK_SUCCESS;
+
+    // Check if this physical device is already in the old buffer
+    if (NULL != inst->phys_devs_term) {
+        for (uint32_t old_idx = 0; old_idx < inst->phys_dev_count_term; old_idx++) {
+            if (drivers[driver_index].phys_devs[pdev_index] == inst->phys_devs_term[old_idx]->phys_dev) {
+                *output_pdev = inst->phys_devs_term[old_idx];
+                break;
+            }
+        }
+    }
+
+    // If this physical device isn't in the old buffer, then we need to create it.
+    if (NULL == *output_pdev) {
+        *output_pdev = loader_instance_heap_alloc(inst, sizeof(struct loader_physical_device_term),
+            VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+        if (NULL == *output_pdev) {
+            loader_log(inst, VK_DEBUG_REPORT_ERROR_BIT_EXT, 0,
+                "setupLoaderTermPhysDevs:  Failed to allocate physical device terminator object");
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto out;
+        }
+
+        loader_set_dispatch((void *)*output_pdev, inst->disp);
+        (*output_pdev)->this_icd_term = drivers[driver_index].this_icd_term;
+        (*output_pdev)->icd_index = (uint8_t)driver_index;
+        (*output_pdev)->phys_dev = drivers[driver_index].phys_devs[pdev_index];
+    }
+
+out:
+    return result;
+}
+
 VkResult setupLoaderTermPhysDevs(struct loader_instance *inst) {
     VkResult res = VK_SUCCESS;
     struct loader_icd_term *icd_term;
@@ -6373,6 +6414,24 @@ VkResult setupLoaderTermPhysDevs(struct loader_instance *inst) {
         }
         inst->total_gpu_count += icd_phys_dev_array[icd_idx].count;
         icd_phys_dev_array[icd_idx].this_icd_term = icd_term;
+
+#if defined(WIN32)
+        // On Windows, we need to store the ids so we can match the VkPhysicalDevice to the IDXGIAdapter
+        icd_phys_dev_array[icd_idx].ids = loader_stack_alloc(sizeof(VkPhysicalDeviceIDProperties) * icd_phys_dev_array[icd_idx].count);
+        for (uint32_t i = 0; i < icd_phys_dev_array[icd_idx].count; ++i) {
+            if (icd_term->dispatch.GetPhysicalDeviceProperties2 != NULL) {
+                icd_phys_dev_array[icd_idx].ids[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+                icd_phys_dev_array[icd_idx].ids[i].pNext = NULL;
+                VkPhysicalDeviceProperties2 properties = {
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                    .pNext = &icd_phys_dev_array[icd_idx].ids[i],
+                };
+                icd_term->dispatch.GetPhysicalDeviceProperties2(icd_phys_dev_array[icd_idx].phys_devs[i], &properties);
+            } else {
+                icd_phys_dev_array[icd_idx].ids[i].deviceLUIDValid = VK_FALSE;
+            }
+        }
+#endif
     }
 
     if (0 == inst->total_gpu_count) {
@@ -6395,40 +6454,49 @@ VkResult setupLoaderTermPhysDevs(struct loader_instance *inst) {
     }
     memset(new_phys_devs, 0, sizeof(struct loader_physical_device_term *) * inst->total_gpu_count);
 
-    // Copy or create everything to fill the new array of physical devices
     uint32_t idx = 0;
-    for (uint32_t icd_idx = 0; icd_idx < inst->total_icd_count; icd_idx++) {
-        for (uint32_t pd_idx = 0; pd_idx < icd_phys_dev_array[icd_idx].count; pd_idx++) {
-            // Check if this physical device is already in the old buffer
-            if (NULL != inst->phys_devs_term) {
-                for (uint32_t old_idx = 0; old_idx < inst->phys_dev_count_term; old_idx++) {
-                    if (icd_phys_dev_array[icd_idx].phys_devs[pd_idx] == inst->phys_devs_term[old_idx]->phys_dev) {
-                        new_phys_devs[idx] = inst->phys_devs_term[old_idx];
-                        break;
+
+#if defined(WIN32)
+    // On Windows we need to get the desired order of the physical devices from the OS
+    typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
+    HMODULE dxgi = LoadLibrary("dxgi.dll");
+    PFN_CreateDXGIFactory1 create_dxgi_factory_1 = (PFN_CreateDXGIFactory1) GetProcAddress(dxgi, "CreateDXGIFactory1");
+
+    IDXGIFactory6 *factory;
+    HRESULT hres = create_dxgi_factory_1(&IID_IDXGIFactory6, &factory);
+
+    IDXGIAdapter *adapters;
+    for (UINT i = 0; factory->lpVtbl->EnumAdapterByGpuPreference(factory, i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, &IID_IDXGIAdapter, &adapters) == S_OK; ++i) {
+        DXGI_ADAPTER_DESC desc;
+        adapters->lpVtbl->GetDesc(adapters, &desc);
+
+        bool found_pdev = false;
+        for (uint32_t icd = 0; icd < inst->total_icd_count && !found_pdev; ++icd) {
+            for (uint32_t pdev = 0; pdev < icd_phys_dev_array[icd].count && !found_pdev; ++pdev) {
+                if (icd_phys_dev_array[icd].ids[pdev].deviceLUIDValid) {
+                    if (memcmp(&desc.AdapterLuid, icd_phys_dev_array[icd].ids[pdev].deviceLUID, sizeof(LUID)) == 0) {
+                        //res = AddTermPhysDev(inst, icd_phys_dev_array, icd, pdev, &new_phys_devs[idx]);
+                        // Add the physical device
+                        found_pdev = true;
                     }
                 }
             }
-            // If this physical device isn't in the old buffer, then we
-            // need to create it.
-            if (NULL == new_phys_devs[idx]) {
-                new_phys_devs[idx] = loader_instance_heap_alloc(inst, sizeof(struct loader_physical_device_term),
-                                                                VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
-                if (NULL == new_phys_devs[idx]) {
-                    loader_log(inst, VK_DEBUG_REPORT_ERROR_BIT_EXT, 0,
-                               "setupLoaderTermPhysDevs:  Failed to allocate "
-                               "physical device terminator object %d",
-                               idx);
-                    inst->total_gpu_count = idx;
-                    res = VK_ERROR_OUT_OF_HOST_MEMORY;
-                    goto out;
-                }
+        }
+    }
+#endif
 
-                loader_set_dispatch((void *)new_phys_devs[idx], inst->disp);
-                new_phys_devs[idx]->this_icd_term = icd_phys_dev_array[icd_idx].this_icd_term;
-                new_phys_devs[idx]->icd_index = (uint8_t)(icd_idx);
-                new_phys_devs[idx]->phys_dev = icd_phys_dev_array[icd_idx].phys_devs[pd_idx];
+    // Copy or create everything to fill the new array of physical devices
+    for (uint32_t icd_idx = 0; icd_idx < inst->total_icd_count; icd_idx++) {
+        for (uint32_t pd_idx = 0; pd_idx < icd_phys_dev_array[icd_idx].count; pd_idx++) {
+            // TODO: check if it was already added above
+            // Add the physical device to the new buffer, copying it from the old one if it is there
+            res = AddTermPhysDev(inst, icd_phys_dev_array, icd_idx, pd_idx, &new_phys_devs[idx]);
+            if (res == VK_SUCCESS) {
+                idx++;
+            } else if (res == VK_ERROR_OUT_OF_HOST_MEMORY) {
+                inst->total_gpu_count = idx;
+                goto out;
             }
-            idx++;
         }
     }
 
