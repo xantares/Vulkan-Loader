@@ -3809,7 +3809,9 @@ static VkResult ReadManifestsFromD3DAdapters(const struct loader_instance *inst,
         .pAdapters = NULL
     };
     D3DDDI_QUERYREGISTRY_INFO *full_info = NULL;
+    size_t full_info_size = 0;
     char *json_path = NULL;
+    size_t json_path_size = 0;
 
     // Get all of the adapters
     NTSTATUS status = D3DKMTEnumAdapters2(&adapters);
@@ -3830,6 +3832,9 @@ static VkResult ReadManifestsFromD3DAdapters(const struct loader_instance *inst,
         // The first query should just check if the field exists and how big it is
         D3DDDI_QUERYREGISTRY_INFO filename_info = {
             .QueryType = D3DDDI_QUERYREGISTRY_ADAPTERKEY,
+            .QueryFlags = {
+                .TranslatePath = true,
+            },
             .ValueType = REG_MULTI_SZ,
             .PhysicalAdapterIndex = 0,
         };
@@ -3838,7 +3843,7 @@ static VkResult ReadManifestsFromD3DAdapters(const struct loader_instance *inst,
             .hAdapter = adapters.pAdapters[i].hAdapter,
             .Type = KMTQAITYPE_QUERYREGISTRY,
             .pPrivateDriverData = &filename_info,
-             .PrivateDriverDataSize = sizeof(filename_info),
+            .PrivateDriverDataSize = sizeof(filename_info),
         };
         status = D3DKMTQueryAdapterInfo(&query_info);
 
@@ -3848,32 +3853,44 @@ static VkResult ReadManifestsFromD3DAdapters(const struct loader_instance *inst,
             status = D3DKMTQueryAdapterInfo(&query_info);
         }
 
-        if (status != STATUS_SUCCESS) {
+        if (status != STATUS_SUCCESS || filename_info.Status != D3DDDI_QUERYREGISTRY_STATUS_BUFFER_OVERFLOW) {
             continue;
         }
 
-        // The second query needs to allocate space for the string to overflow out the back of the struct
-        size_t full_size = sizeof(filename_info) + (filename_info.OutputValueSize * sizeof(WCHAR));
-        full_info = loader_instance_heap_alloc(inst, full_size, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
-        if (full_info == NULL) {
-            result = VK_ERROR_OUT_OF_HOST_MEMORY;
-            goto out;
+        while (status == STATUS_SUCCESS && ((D3DDDI_QUERYREGISTRY_INFO*)query_info.pPrivateDriverData)->Status == D3DDDI_QUERYREGISTRY_STATUS_BUFFER_OVERFLOW) {
+            bool needs_copy = (full_info == NULL);
+            // The second or later query needs to allocate space for the string to overflow out the back of the struct.
+            // Include space for extra data beyond the end of the OS struct. Needs extra space for "host" substring
+            // and a "\??\" system drive prefix. The OS has a bug where it under-estimates the required amount of space.
+            size_t full_size = sizeof(D3DDDI_QUERYREGISTRY_INFO) + filename_info.OutputValueSize + sizeof(L"\\??\\host");
+            void* buffer = loader_instance_heap_realloc(inst, full_info, full_info_size, full_size, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+            if (buffer == NULL) {
+                result = VK_ERROR_OUT_OF_HOST_MEMORY;
+                goto out;
+            }
+            full_info = buffer;
+            full_info_size = full_size;
+
+            if (needs_copy) {
+                memcpy(full_info, &filename_info, sizeof(D3DDDI_QUERYREGISTRY_INFO));
+            }
+            query_info.pPrivateDriverData = full_info;
+            query_info.PrivateDriverDataSize = (UINT) full_info_size;
+            status = D3DKMTQueryAdapterInfo(&query_info);
         }
 
-        memcpy(full_info, &filename_info, sizeof(filename_info));
-        query_info.pPrivateDriverData = full_info;
-        query_info.PrivateDriverDataSize = (UINT) full_size;
-        status = D3DKMTQueryAdapterInfo(&query_info);
-        if (status != STATUS_SUCCESS) {
+        if (status != STATUS_SUCCESS || full_info->Status != D3DDDI_QUERYREGISTRY_STATUS_SUCCESS) {
             goto out;
         }
 
         // Convert the wide string to a narrow string
-        json_path = loader_instance_heap_alloc(inst, full_info->OutputValueSize, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
-        if (json_path == NULL) {
+        void* buffer = loader_instance_heap_realloc(inst, json_path, json_path_size, full_info->OutputValueSize, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+        if (buffer == NULL) {
             result = VK_ERROR_OUT_OF_HOST_MEMORY;
             goto out;
         }
+        json_path = buffer;
+        json_path_size = full_info->OutputValueSize;
 
         // Iterate over each component string
         for (const wchar_t *curr_path = full_info->OutputString; curr_path[0] != '\0'; curr_path += wcslen(curr_path) + 1) {
@@ -3891,11 +3908,6 @@ static VkResult ReadManifestsFromD3DAdapters(const struct loader_instance *inst,
                 break;
             }
         }
-
-        loader_instance_heap_free(inst, json_path);
-        json_path = NULL;
-        loader_instance_heap_free(inst, full_info);
-        full_info = NULL;
     }
 
 out:
