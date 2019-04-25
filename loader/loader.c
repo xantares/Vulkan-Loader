@@ -3848,7 +3848,7 @@ static VkResult ReadManifestsFromD3DAdapters(const struct loader_instance *inst,
         status = D3DKMTQueryAdapterInfo(&query_info);
 
         // This error indicates that the type didn't match, so we'll try a REG_SZ
-        if (status == STATUS_INVALID_PARAMETER) {
+        if (status != STATUS_SUCCESS) {
             filename_info.ValueType = REG_SZ;
             status = D3DKMTQueryAdapterInfo(&query_info);
         }
@@ -3884,17 +3884,18 @@ static VkResult ReadManifestsFromD3DAdapters(const struct loader_instance *inst,
         }
 
         // Convert the wide string to a narrow string
-        void* buffer = loader_instance_heap_realloc(inst, json_path, json_path_size, full_info->OutputValueSize, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+        size_t full_size = full_info->OutputValueSize + sizeof(L"\\??\\host");
+        void* buffer = loader_instance_heap_realloc(inst, json_path, full_size, full_info->OutputValueSize, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
         if (buffer == NULL) {
             result = VK_ERROR_OUT_OF_HOST_MEMORY;
             goto out;
         }
         json_path = buffer;
-        json_path_size = full_info->OutputValueSize;
+        json_path_size = full_size;
 
         // Iterate over each component string
         for (const wchar_t *curr_path = full_info->OutputString; curr_path[0] != '\0'; curr_path += wcslen(curr_path) + 1) {
-            WideCharToMultiByte(CP_UTF8, 0, curr_path, full_info->OutputValueSize / sizeof(WCHAR), json_path, full_info->OutputValueSize, NULL, NULL);
+            WideCharToMultiByte(CP_UTF8, 0, curr_path, -1, json_path, (int)json_path_size, NULL, NULL);
 
             // Add the string to the output list
             result = VK_SUCCESS;
