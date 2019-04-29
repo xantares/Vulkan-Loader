@@ -3859,10 +3859,7 @@ static VkResult ReadManifestsFromD3DAdapters(const struct loader_instance *inst,
 
         while (status == STATUS_SUCCESS && ((D3DDDI_QUERYREGISTRY_INFO*)query_info.pPrivateDriverData)->Status == D3DDDI_QUERYREGISTRY_STATUS_BUFFER_OVERFLOW) {
             bool needs_copy = (full_info == NULL);
-            // The second or later query needs to allocate space for the string to overflow out the back of the struct.
-            // Include space for extra data beyond the end of the OS struct. Needs extra space for "host" substring
-            // and a "\??\" system drive prefix. The OS has a bug where it under-estimates the required amount of space.
-            size_t full_size = sizeof(D3DDDI_QUERYREGISTRY_INFO) + filename_info.OutputValueSize + sizeof(L"\\??\\host");
+            size_t full_size = sizeof(D3DDDI_QUERYREGISTRY_INFO) + filename_info.OutputValueSize;
             void* buffer = loader_instance_heap_realloc(inst, full_info, full_info_size, full_size, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
             if (buffer == NULL) {
                 result = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -3884,14 +3881,13 @@ static VkResult ReadManifestsFromD3DAdapters(const struct loader_instance *inst,
         }
 
         // Convert the wide string to a narrow string
-        size_t full_size = full_info->OutputValueSize + sizeof(L"\\??\\host");
-        void* buffer = loader_instance_heap_realloc(inst, json_path, full_size, full_info->OutputValueSize, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+        void* buffer = loader_instance_heap_realloc(inst, json_path, json_path_size, full_info->OutputValueSize, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
         if (buffer == NULL) {
             result = VK_ERROR_OUT_OF_HOST_MEMORY;
             goto out;
         }
         json_path = buffer;
-        json_path_size = full_size;
+        json_path_size = full_info->OutputValueSize;
 
         // Iterate over each component string
         for (const wchar_t *curr_path = full_info->OutputString; curr_path[0] != '\0'; curr_path += wcslen(curr_path) + 1) {
