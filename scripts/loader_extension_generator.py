@@ -1443,6 +1443,7 @@ class LoaderExtensionOutputGenerator(OutputGenerator):
 
         count = 0
         is_extension = False
+        last_protect = None
         for ext_cmd in self.ext_commands:
             if ext_cmd.name in DEVICE_CMDS_NEED_TERM:
                 if ext_cmd.ext_name != cur_extension_name:
@@ -1457,15 +1458,15 @@ class LoaderExtensionOutputGenerator(OutputGenerator):
                         term_func += '\n    // ---- Core %s commands\n' % ext_cmd.ext_name[11:]
                     else:
                         term_func += '\n    // ---- %s extension commands\n' % ext_cmd.ext_name
+                        last_protect = ext_cmd.protect
+                        if ext_cmd.protect is not None:
+                            term_func += '#ifdef %s\n' % ext_cmd.protect
                         if ext_cmd.require:
                             term_func += '    if (dev->extensions.%s_enabled && dev->extensions.%s_enabled) {\n' % (ext_cmd.ext_name[3:].lower(), ext_cmd.require[3:].lower())
                         else:
                             term_func += '    if (dev->extensions.%s_enabled) {\n' % ext_cmd.ext_name[3:].lower()
                         is_extension = True
                     cur_extension_name = ext_cmd.ext_name
-
-                if ext_cmd.protect is not None:
-                    term_func += '#ifdef %s\n' % ext_cmd.protect
 
                 if count == 0:
                     term_func += '        if'
@@ -1474,15 +1475,14 @@ class LoaderExtensionOutputGenerator(OutputGenerator):
                 term_func += '(!strcmp(pName, "%s")) {\n' % (ext_cmd.name)
                 term_func += '            addr = (PFN_vkVoidFunction)terminator_%s;\n' % (ext_cmd.name[2:])
 
-                if ext_cmd.protect is not None:
-                    term_func += '#endif // %s\n' % ext_cmd.protect
-
                 count += 1
 
         if count > 0:
             term_func += '        }\n'
         if is_extension:
             term_func += '    }\n'
+            if last_protect is not None:
+                term_func += '#endif // %s\n' % last_protect
 
         term_func += '    return addr;\n'
         term_func += '}\n\n'
