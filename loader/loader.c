@@ -326,7 +326,8 @@ static inline char *loader_getenv(const char *name, const struct loader_instance
 }
 
 static inline char *loader_secure_getenv(const char *name, const struct loader_instance *inst) {
-    if (IsHighIntegrity()) {
+    // TDEHACK: Allow VK_LAYER_PATH through
+    if (strcmp(name, "VK_LAYER_PATH") != 0 && IsHighIntegrity()) {
         return NULL;
     }
 
