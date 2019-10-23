@@ -326,12 +326,12 @@ static inline char *loader_getenv(const char *name, const struct loader_instance
 }
 
 static inline char *loader_secure_getenv(const char *name, const struct loader_instance *inst) {
-    // TDEHACK: Allow VK_LAYER_PATH through
-    if (strcmp(name, "VK_LAYER_PATH") != 0 && IsHighIntegrity()) {
-        return NULL;
+    // TDEHACK: Always allow VK_LAYER_PATH and VK_ICD_FILENAMES through
+    if (strcmp(name, "VK_LAYER_PATH") != 0 || strcmp(name, "VK_ICD_FILENAMES") != 0 || !IsHighIntegrity()) {
+        return loader_getenv(name, inst);
     }
 
-    return loader_getenv(name, inst);
+    return NULL;
 }
 
 static inline void loader_free_getenv(char *val, const struct loader_instance *inst) {
