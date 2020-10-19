@@ -279,21 +279,23 @@ static inline char *loader_secure_getenv(const char *name, const struct loader_i
     return IsHighIntegrity() ? NULL : loader_getenv(name, inst);
 #else
 // Linux
-#if defined(HAVE_SECURE_GETENV) && !defined(USE_UNSAFE_FILE_SEARCH)
+#if !defined(USE_UNSAFE_FILE_SEARCH)
+#if defined(HAVE_SECURE_GETENV)
     (void)inst;
     out = secure_getenv(name);
-#elif defined(HAVE___SECURE_GETENV) && !defined(USE_UNSAFE_FILE_SEARCH)
+#elif defined(HAVE___SECURE_GETENV)
     (void)inst;
     out = __secure_getenv(name);
-#else
-    out = loader_getenv(name, inst);
 #endif
-#endif
-    if (out == NULL) {
+    if (out == NULL && (IsHighIntegrity() || geteuid() == 0)) {
         loader_log(inst, LOADER_INFO_BIT, 0,
                    "Loader is running with elevated permissions. Environment variable %s will be ignored.", name);
     }
     return out;
+#else
+    return loader_getenv(name, inst);
+#endif
+#endif
 }
 
 static inline void loader_free_getenv(char *val, const struct loader_instance *inst) {
